@@ -39,6 +39,7 @@ type OpenRouterAccount struct {
 	Name          string  `json:"name"`
 	APIKey        string  `json:"api_key"`
 	MinBalanceUSD float64 `json:"min_balance_usd"` // 低于该美元余额触发告警（默认 5）
+	ProxyURL      string  `json:"proxy_url,omitempty"`
 }
 
 type XiaomiMiMoAccount struct {
@@ -151,7 +152,15 @@ func applyEnvOverrides(cfg *Config) {
 			Name:          "OpenRouter 默认账号",
 			APIKey:        key,
 			MinBalanceUSD: minBal,
+			ProxyURL:      strings.TrimSpace(os.Getenv("OPENROUTER_PROXY_URL")),
 		})
+	}
+	if proxy := strings.TrimSpace(os.Getenv("OPENROUTER_PROXY_URL")); proxy != "" {
+		for i := range cfg.OpenRouter {
+			if cfg.OpenRouter[i].ProxyURL == "" {
+				cfg.OpenRouter[i].ProxyURL = proxy
+			}
+		}
 	}
 
 	if cookie := strings.TrimSpace(os.Getenv("XIAOMI_MIMO_COOKIE")); cookie != "" && len(cfg.XiaomiMiMo) == 0 {

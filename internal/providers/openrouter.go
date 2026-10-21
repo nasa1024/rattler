@@ -2,10 +2,14 @@ package providers
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -39,11 +43,11 @@ func CheckOpenRouter(ctx context.Context, acc config.OpenRouterAccount) AccountR
 		ConsoleURL:  "https://openrouter.ai/settings/credits",
 	}
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := newOpenRouterHTTPClient(acc.ProxyURL)
 	apiKey := strings.TrimSpace(acc.APIKey)
 
 	// 1. 优先查询账户级总充值与消耗 (/api/v1/credits)
-	creditsStatus, creditsBody, err := doOpenRouterGet(ctx, client, "https://openrouter.ai/api/v1/credits", apiKey)
+	creditsStatus, creditsBody, err := doOpenRouterGetWithRetry(ctx, client, "https://openrouter.ai/api/v1/credits", apiKey, 3)
 	if err != nil {
 		return markError(report, "网络请求失败", err.Error())
 	}
@@ -91,7 +95,7 @@ func CheckOpenRouter(ctx context.Context, acc config.OpenRouterAccount) AccountR
 	}
 
 	// 2. 若 Key 无 /credits 权限，回退查询 /api/v1/key 的单 Key 限额与用量
-	keyStatus, keyBody, err := doOpenRouterGet(ctx, client, "https://openrouter.ai/api/v1/key", apiKey)
+	keyStatus, keyBody, err := doOpenRouterGetWithRetry(ctx, client, "https://openrouter.ai/api/v1/key", apiKey, 3)
 	if err != nil {
 		return markError(report, "网络请求失败", err.Error())
 	}
@@ -161,13 +165,76 @@ func CheckOpenRouter(ctx context.Context, acc config.OpenRouterAccount) AccountR
 	return report
 }
 
-func doOpenRouterGet(ctx context.Context, client *http.Client, url, apiKey string) (int, []byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func newOpenRouterHTTPClient(configuredProxy string) *http.Client {
+	proxyFunc := http.ProxyFromEnvironment
+	proxyStr := strings.TrimSpace(configuredProxy)
+	if proxyStr == "" {
+		for _, envKey := range []string{"OPENROUTER_PROXY_URL", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"} {
+			if v := strings.TrimSpace(os.Getenv(envKey)); v != "" {
+				proxyStr = v
+				break
+			}
+		}
+	}
+	if proxyStr != "" {
+		if !strings.Contains(proxyStr, "://") {
+			proxyStr = "http://" + proxyStr
+		}
+		if u, err := url.Parse(proxyStr); err == nil {
+			proxyFunc = http.ProxyURL(u)
+		}
+	}
+
+	transport := &http.Transport{
+		Proxy: proxyFunc,
+		DialContext: (&net.Dialer{
+			Timeout:   15 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   20 * time.Second,
+		ResponseHeaderTimeout: 20 * time.Second,
+		DisableKeepAlives:     true,
+		ForceAttemptHTTP2:     false,
+		// 强制使用 HTTP/1.1 避免经过 Clash/代理隧道时与 Cloudflare H2 ALPN 握手卡死或 EOF
+		TLSNextProto: make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
+	}
+
+	return &http.Client{
+		Timeout:   25 * time.Second,
+		Transport: transport,
+	}
+}
+
+func doOpenRouterGetWithRetry(ctx context.Context, client *http.Client, targetURL, apiKey string, attempts int) (int, []byte, error) {
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return 0, nil, ctx.Err()
+			case <-time.After(time.Duration(i) * 800 * time.Millisecond):
+			}
+		}
+		status, body, err := doOpenRouterGet(ctx, client, targetURL, apiKey)
+		if err == nil {
+			return status, body, nil
+		}
+		lastErr = err
+	}
+	return 0, nil, lastErr
+}
+
+func doOpenRouterGet(ctx context.Context, client *http.Client, targetURL, apiKey string) (int, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
 		return 0, nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "rattler/0.1.0")
 
 	resp, err := client.Do(req)
 	if err != nil {
