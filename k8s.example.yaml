@@ -1,0 +1,86 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rattler-config
+  namespace: default
+type: Opaque
+stringData:
+  config.json: |
+    {
+      "feishu": {
+        "webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+        "secret": "",
+        "at_all_on_alert": true
+      },
+      "schedule": {
+        "check_interval_minutes": 60,
+        "alert_cooldown_minutes": 360,
+        "daily_report_time": "09:00"
+      },
+      "deepseek": [
+        {
+          "name": "DeepSeek 默认账号",
+          "api_key": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "min_balance": 20.0
+        }
+      ],
+      "openrouter": [
+        {
+          "name": "OpenRouter 默认账号",
+          "api_key": "sk-or-v1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "min_balance_usd": 5.0
+        }
+      ],
+      "xiaomi_mimo": [
+        {
+          "name": "小米 MiMo Standard",
+          "cookie": "api-platform_serviceToken=\"...\"; userId=...; api-platform_slh=\"...\"; api-platform_ph=\"...\"",
+          "max_used_percent": 85.0,
+          "min_balance_cny": 0.0
+        }
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rattler
+  namespace: default
+  labels:
+    app: rattler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rattler
+  template:
+    metadata:
+      labels:
+        app: rattler
+    spec:
+      containers:
+        - name: rattler
+          image: ghcr.io/nasa1024/rattler:0.1.0
+          imagePullPolicy: Always
+          args:
+            - "-config"
+            - "/app/config.json"
+          env:
+            - name: TZ
+              value: "Asia/Shanghai"
+          volumeMounts:
+            - name: config-vol
+              mountPath: /app/config.json
+              subPath: config.json
+              readOnly: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+      volumes:
+        - name: config-vol
+          secret:
+            secretName: rattler-config
