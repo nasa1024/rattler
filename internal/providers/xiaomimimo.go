@@ -240,6 +240,7 @@ func fetchMimoEndpoint(ctx context.Context, client *http.Client, path, cookie st
 	req.Header.Set("Accept", "application/json, */*")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Referer", "https://platform.xiaomimimo.com/console/plan-manage")
+	req.Header.Set("x-timezone", "Asia/Shanghai")
 	req.Header.Set("Cookie", cookie)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 
