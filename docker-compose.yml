@@ -1,0 +1,9 @@
+services:
+  rattler:
+    image: ghcr.io/nasa1024/rattler:0.1.0
+    container_name: rattler
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./config.json:/app/config.json:ro

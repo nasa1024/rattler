@@ -1,0 +1,34 @@
+{
+  "feishu": {
+    "webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+    "secret": "",
+    "at_all_on_alert": true
+  },
+  "schedule": {
+    "check_interval_minutes": 60,
+    "alert_cooldown_minutes": 360,
+    "daily_report_time": "09:30"
+  },
+  "deepseek": [
+    {
+      "name": "DeepSeek 主账号",
+      "api_key": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "min_balance": 20.0
+    }
+  ],
+  "openrouter": [
+    {
+      "name": "OpenRouter 主账号",
+      "api_key": "sk-or-v1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "min_balance_usd": 5.0
+    }
+  ],
+  "xiaomi_mimo": [
+    {
+      "name": "小米 MiMo TokenPlan",
+      "cookie": "api-platform_serviceToken=xxxxxx; userId=123456789",
+      "max_used_percent": 85.0,
+      "min_balance_cny": 0.0
+    }
+  ]
+}
