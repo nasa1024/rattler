@@ -5,16 +5,24 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nasa1024/rattler/internal/config"
 )
 
 const mimoBaseURL = "https://platform.xiaomimimo.com/api/v1"
+
+var (
+	mimoSessionMu    sync.Mutex
+	mimoSessionCache = make(map[string]string)
+)
 
 type mimoEnvelope struct {
 	Code     any             `json:"code"`
@@ -65,12 +73,18 @@ func CheckXiaomiMiMo(ctx context.Context, acc config.XiaomiMiMoAccount) AccountR
 	}
 
 	cookie := cleanCookie(acc.Cookie)
-	if cookie == "" {
+	passToken, userID, deviceID := extractPassCredentials(acc, cookie)
+	cacheKey := acc.Name + "|" + userID
+	if cached := getCachedMimoCookie(cacheKey); cached != "" {
+		cookie = cached
+	}
+
+	if cookie == "" && passToken == "" {
 		report.Status = StatusAuthExpired
 		report.TagText = "缺少凭证"
 		report.TagColor = "orange"
-		report.Headline = "未配置控制台 Cookie"
-		report.AlertReason = "小米 MiMo TokenPlan 需配置 platform.xiaomimimo.com 控制台 Cookie (含 api-platform_serviceToken 与 userId)"
+		report.Headline = "未配置控制台 Cookie 或 passToken"
+		report.AlertReason = "小米 MiMo TokenPlan 需配置 pass_token + user_id（推荐长期免维护）或控制台 Cookie"
 		return report
 	}
 
@@ -85,12 +99,37 @@ func CheckXiaomiMiMo(ctx context.Context, acc config.XiaomiMiMoAccount) AccountR
 	if err != nil {
 		return markError(report, "网络请求失败", err.Error())
 	}
+	if isMimoAuthExpired(status, usageEnv) && passToken != "" && userID != "" {
+		loginURL := strings.TrimSpace(usageEnv.LoginURL)
+		if loginURL == "" && len(usageEnv.Data) > 0 {
+			var tmp mimoUsageData
+			if json.Unmarshal(usageEnv.Data, &tmp) == nil {
+				loginURL = strings.TrimSpace(tmp.LoginURL)
+			}
+		}
+		mintedCookie, mintErr := mintMimoServiceCookie(ctx, client, loginURL, passToken, userID, deviceID, cleanCookie(acc.Cookie))
+		if mintErr == nil && mintedCookie != "" {
+			log.Printf("[Xiaomi MiMo] %s: 已通过小米通行证 passToken 自动续期 api-platform_serviceToken", acc.Name)
+			cookie = mintedCookie
+			setCachedMimoCookie(cacheKey, cookie)
+			usageEnv, status, err = fetchMimoEndpoint(ctx, client, "/tokenPlan/usage", cookie)
+			if err != nil {
+				return markError(report, "网络请求失败", err.Error())
+			}
+		} else if mintErr != nil {
+			log.Printf("[Xiaomi MiMo] %s: passToken 自动续期失败: %v", acc.Name, mintErr)
+		}
+	}
 	if isMimoAuthExpired(status, usageEnv) {
 		report.Status = StatusAuthExpired
 		report.TagText = "Cookie 过期"
 		report.TagColor = "orange"
 		report.Headline = "控制台登录态已过期"
-		report.AlertReason = "小米 MiMo 控制台 Cookie 已失效，请打开 platform.xiaomimimo.com 重新复制 Cookie"
+		if passToken != "" {
+			report.AlertReason = "小米通行证 passToken 已失效或需二次验证，请前往 account.xiaomi.com 重新获取 passToken"
+		} else {
+			report.AlertReason = "小米 MiMo 控制台 Cookie (24h 有效期) 已失效，建议配置 account.xiaomi.com 的 passToken 实现自动续期"
+		}
 		return report
 	}
 	if code := parseCode(usageEnv.Code); code != 0 {
@@ -267,10 +306,317 @@ func isMimoAuthExpired(httpStatus int, env mimoEnvelope) bool {
 	if code == 401 || code == 403 {
 		return true
 	}
-	if env.LoginURL != "" {
+	if strings.TrimSpace(env.LoginURL) != "" {
 		return true
 	}
+	if len(env.Data) > 0 {
+		var tmp struct {
+			LoginURL string `json:"loginUrl"`
+		}
+		if json.Unmarshal(env.Data, &tmp) == nil && strings.TrimSpace(tmp.LoginURL) != "" {
+			return true
+		}
+	}
 	return false
+}
+
+func getCachedMimoCookie(key string) string {
+	mimoSessionMu.Lock()
+	defer mimoSessionMu.Unlock()
+	return mimoSessionCache[key]
+}
+
+func setCachedMimoCookie(key, cookie string) {
+	mimoSessionMu.Lock()
+	defer mimoSessionMu.Unlock()
+	mimoSessionCache[key] = cookie
+}
+
+func parseCookiePairs(raw string) map[string]string {
+	out := make(map[string]string)
+	for _, part := range strings.Split(cleanCookie(raw), ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		idx := strings.IndexByte(part, '=')
+		if idx <= 0 {
+			continue
+		}
+		k := strings.TrimSpace(part[:idx])
+		v := strings.TrimSpace(part[idx+1:])
+		if k != "" && v != "" {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+func extractPassCredentials(acc config.XiaomiMiMoAccount, rawCookie string) (passToken, userID, deviceID string) {
+	pairs := parseCookiePairs(rawCookie)
+	passToken = strings.TrimSpace(acc.PassToken)
+	if passToken == "" {
+		passToken = strings.Trim(pairs["passToken"], `"`)
+	}
+	userID = strings.TrimSpace(acc.UserID)
+	if userID == "" {
+		userID = strings.Trim(pairs["userId"], `"`)
+	}
+	deviceID = strings.TrimSpace(acc.DeviceID)
+	if deviceID == "" {
+		deviceID = strings.Trim(pairs["deviceId"], `"`)
+	}
+	return passToken, userID, deviceID
+}
+
+// mintMimoServiceCookie exchanges a Xiaomi Account passToken + userId + deviceId for a fresh
+// api-platform_serviceToken on platform.xiaomimimo.com via Xiaomi SSO (serviceLogin?_json=true -> serviceLoginAuth2 -> /sts).
+func mintMimoServiceCookie(ctx context.Context, client *http.Client, loginURL, passToken, userID, deviceID, baseCookie string) (string, error) {
+	if loginURL == "" {
+		env, _, err := fetchMimoEndpoint(ctx, client, "/balance", "")
+		if err != nil {
+			return "", fmt.Errorf("fetch SSO loginUrl: %w", err)
+		}
+		loginURL = strings.TrimSpace(env.LoginURL)
+		if loginURL == "" && len(env.Data) > 0 {
+			var tmp struct {
+				LoginURL string `json:"loginUrl"`
+			}
+			if json.Unmarshal(env.Data, &tmp) == nil {
+				loginURL = strings.TrimSpace(tmp.LoginURL)
+			}
+		}
+	}
+	if loginURL == "" {
+		return "", fmt.Errorf("xiaomi mimo API did not return loginUrl")
+	}
+
+	callback := extractCallbackFromLoginURL(loginURL)
+	if callback == "" {
+		return "", fmt.Errorf("failed to extract callback from loginUrl")
+	}
+
+	if deviceID == "" {
+		deviceID = "wb_rattler_default"
+	}
+	accountCookie := fmt.Sprintf("passToken=%s; deviceId=%s; uLocale=zh_CN; pass_ua=web; passInfo=login-end; userId=%s",
+		strings.Trim(passToken, `"`), deviceID, userID)
+
+	chromeUA := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+	setCommonHeaders := func(req *http.Request) {
+		req.Header.Set("Accept", "application/json, text/plain, */*")
+		req.Header.Set("User-Agent", chromeUA)
+		req.Header.Set("Cookie", accountCookie)
+		req.Header.Set("X-Requested-With", "XMLHttpRequest")
+		req.Header.Set("Referer", "https://account.xiaomi.com/fe/service/login")
+	}
+
+	// Step 1: GET /pass/serviceLogin?_json=true&sid=api-platform&callback=...
+	slURL := fmt.Sprintf("https://account.xiaomi.com/pass/serviceLogin?_json=true&sid=api-platform&callback=%s", url.QueryEscape(callback))
+	req1, err := http.NewRequestWithContext(ctx, http.MethodGet, slURL, nil)
+	if err != nil {
+		return "", err
+	}
+	setCommonHeaders(req1)
+
+	resp1, err := client.Do(req1)
+	if err != nil {
+		return "", err
+	}
+	body1, _ := io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+
+	loginBody, err := parseXiaomiJSONP(string(body1))
+	if err != nil {
+		return "", fmt.Errorf("serviceLogin parse error: %w", err)
+	}
+
+	stsLocation := strings.TrimSpace( fmt.Sprint(loginBody["location"]) )
+	if loginBody["location"] == nil {
+		stsLocation = ""
+	}
+
+	// Step 2: If serviceLogin did not directly return the /sts location, try POST /pass/serviceLoginAuth2
+	if parseCode(loginBody["code"]) != 0 || !strings.HasPrefix(stsLocation, "https://platform.xiaomimimo.com") {
+		sign, _ := loginBody["_sign"].(string)
+		if sign == "" {
+			return "", fmt.Errorf("serviceLogin did not return _sign (code=%v)", loginBody["code"])
+		}
+		serviceParam, _ := loginBody["serviceParam"].(string)
+		if serviceParam == "" {
+			serviceParam = `{"checkSafePhone":false,"checkSafeAddress":false,"lsrp_score":0.0}`
+		}
+		qs, _ := loginBody["qs"].(string)
+
+		form := url.Values{}
+		form.Set("bizDeviceType", "")
+		form.Set("needTheme", "false")
+		form.Set("theme", "")
+		form.Set("showActiveX", "false")
+		form.Set("serviceParam", serviceParam)
+		form.Set("callback", callback)
+		form.Set("qs", qs)
+		form.Set("sid", "api-platform")
+		form.Set("_sign", sign)
+		form.Set("_json", "true")
+		form.Set("policyName", "miaccount")
+		form.Set("captCode", "")
+
+		req2, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://account.xiaomi.com/pass/serviceLoginAuth2", strings.NewReader(form.Encode()))
+		if err != nil {
+			return "", err
+		}
+		setCommonHeaders(req2)
+		req2.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+
+		resp2, err := client.Do(req2)
+		if err != nil {
+			return "", err
+		}
+		body2, _ := io.ReadAll(resp2.Body)
+		resp2.Body.Close()
+
+		auth2Body, err := parseXiaomiJSONP(string(body2))
+		if err != nil {
+			return "", fmt.Errorf("serviceLoginAuth2 parse error: %w", err)
+		}
+		if parseCode(auth2Body["code"]) != 0 {
+			desc, _ := auth2Body["description"].(string)
+			return "", fmt.Errorf("serviceLoginAuth2 failed (code=%v %s)", auth2Body["code"], desc)
+		}
+		stsLocation, _ = auth2Body["location"].(string)
+	}
+
+	if stsLocation == "" {
+		return "", fmt.Errorf("SSO did not return /sts location")
+	}
+
+	// Step 3: Follow /sts and subsequent redirects on platform.xiaomimimo.com to collect cookies
+	platformJar := parseCookiePairs(baseCookie)
+	delete(platformJar, "passToken")
+	delete(platformJar, "deviceId")
+	if userID != "" {
+		platformJar["userId"] = userID
+	}
+
+	currentURL := stsLocation
+	for hop := 0; hop < 5 && currentURL != ""; hop++ {
+		u, err := url.Parse(currentURL)
+		if err != nil {
+			return "", err
+		}
+		if strings.EqualFold(u.Hostname(), "platform.xiaomimimo.com") && u.Scheme == "http" {
+			u.Scheme = "https"
+			currentURL = u.String()
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, currentURL, nil)
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("User-Agent", chromeUA)
+		if len(platformJar) > 0 {
+			req.Header.Set("Cookie", serializeCookieMap(platformJar))
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", err
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		for _, rawSC := range resp.Header.Values("Set-Cookie") {
+			name, val, _, expired := parseRawSetCookie(rawSC)
+			if name == "" || val == "" || expired {
+				continue
+			}
+			platformJar[name] = val
+		}
+
+		if resp.StatusCode < 300 || resp.StatusCode >= 400 {
+			break
+		}
+		loc := strings.TrimSpace(resp.Header.Get("Location"))
+		if loc == "" {
+			break
+		}
+		nextU, err := u.Parse(loc)
+		if err != nil {
+			break
+		}
+		currentURL = nextU.String()
+	}
+
+	if platformJar["api-platform_serviceToken"] == "" {
+		return "", fmt.Errorf("/sts did not issue api-platform_serviceToken")
+	}
+	return serializeCookieMap(platformJar), nil
+}
+
+func extractCallbackFromLoginURL(loginURL string) string {
+	u, err := url.Parse(loginURL)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(u.Query().Get("callback"))
+}
+
+func parseXiaomiJSONP(raw string) (map[string]any, error) {
+	s := strings.TrimSpace(raw)
+	const prefix = "&&&START&&&"
+	if strings.HasPrefix(s, prefix) {
+		s = strings.TrimSpace(s[len(prefix):])
+	}
+	var out map[string]any
+	if err := json.Unmarshal([]byte(s), &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func parseRawSetCookie(raw string) (name, val, domain string, expired bool) {
+	parts := strings.Split(raw, ";")
+	if len(parts) == 0 {
+		return "", "", "", false
+	}
+	first := strings.TrimSpace(parts[0])
+	idx := strings.IndexByte(first, '=')
+	if idx <= 0 {
+		return "", "", "", false
+	}
+	name = strings.TrimSpace(first[:idx])
+	val = strings.TrimSpace(first[idx+1:])
+	if strings.EqualFold(strings.Trim(val, `"`), "EXPIRED") {
+		expired = true
+	}
+	for _, attr := range parts[1:] {
+		attr = strings.TrimSpace(attr)
+		aIdx := strings.IndexByte(attr, '=')
+		if aIdx <= 0 {
+			continue
+		}
+		ak := strings.ToLower(strings.TrimSpace(attr[:aIdx]))
+		av := strings.TrimSpace(attr[aIdx+1:])
+		if ak == "domain" {
+			domain = strings.ToLower(av)
+		} else if ak == "max-age" {
+			if ma, err := strconv.Atoi(av); err == nil && ma <= 0 {
+				expired = true
+			}
+		} else if ak == "expires" && strings.Contains(av, "1970") {
+			expired = true
+		}
+	}
+	return name, val, domain, expired
+}
+
+func serializeCookieMap(m map[string]string) string {
+	parts := make([]string, 0, len(m))
+	for k, v := range m {
+		if k != "" && v != "" {
+			parts = append(parts, k+"="+v)
+		}
+	}
+	return strings.Join(parts, "; ")
 }
 
 func extractMimoPlanMetrics(data mimoUsageData) (used, limit, usedPct float64, ok bool) {

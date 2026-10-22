@@ -44,7 +44,10 @@ type OpenRouterAccount struct {
 
 type XiaomiMiMoAccount struct {
 	Name           string  `json:"name"`
-	Cookie         string  `json:"cookie"`           // platform.xiaomimimo.com 控制台 Cookie（需含 api-platform_serviceToken 和 userId）
+	Cookie         string  `json:"cookie"`           // platform.xiaomimimo.com 控制台 Cookie 或含 passToken 的小米通行证 Cookie
+	PassToken      string  `json:"pass_token"`       // 可选：小米通行证 account.xiaomi.com 的长期 passToken（用于自动续期 serviceToken）
+	UserID         string  `json:"user_id"`          // 可选：小米账号 userId（配合 pass_token 自动续期）
+	DeviceID       string  `json:"device_id"`        // 可选：account.xiaomi.com 的 deviceId
 	MaxUsedPercent float64 `json:"max_used_percent"` // TokenPlan 已用百分比超过该阈值触发告警（默认 85）
 	MinBalanceCNY  float64 `json:"min_balance_cny"`  // 可选：现金余额告警线（默认 0 即不按余额告警）
 }
@@ -163,12 +166,19 @@ func applyEnvOverrides(cfg *Config) {
 		}
 	}
 
-	if cookie := strings.TrimSpace(os.Getenv("XIAOMI_MIMO_COOKIE")); cookie != "" && len(cfg.XiaomiMiMo) == 0 {
+	cookie := strings.TrimSpace(os.Getenv("XIAOMI_MIMO_COOKIE"))
+	passToken := strings.TrimSpace(os.Getenv("XIAOMI_MIMO_PASS_TOKEN"))
+	userID := strings.TrimSpace(os.Getenv("XIAOMI_MIMO_USER_ID"))
+	deviceID := strings.TrimSpace(os.Getenv("XIAOMI_MIMO_DEVICE_ID"))
+	if (cookie != "" || passToken != "") && len(cfg.XiaomiMiMo) == 0 {
 		maxPct := parseFloatEnv("XIAOMI_MIMO_MAX_USED_PERCENT", 85.0)
 		minBal := parseFloatEnv("XIAOMI_MIMO_MIN_BALANCE_CNY", 0.0)
 		cfg.XiaomiMiMo = append(cfg.XiaomiMiMo, XiaomiMiMoAccount{
 			Name:           "小米 MiMo 默认账号",
 			Cookie:         cookie,
+			PassToken:      passToken,
+			UserID:         userID,
+			DeviceID:       deviceID,
 			MaxUsedPercent: maxPct,
 			MinBalanceCNY:  minBal,
 		})
