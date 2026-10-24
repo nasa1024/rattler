@@ -1,12 +1,22 @@
 package providers
 
 import (
+	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/md5"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
 	"math"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -19,9 +29,17 @@ import (
 
 const mimoBaseURL = "https://platform.xiaomimimo.com/api/v1"
 
+const xiaomiRSAPubKeyPEM = `-----BEGIN PUBLIC KEY-----
+MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCYEVrK/4Mahiv0pUJgTybx4J9P5
+dUT/Y0PuwMbk+gMU+jrZnBiXGv6/hCH1avIhoBcE535F8nJQQN3UavZdFkYidsoXu
+Enat3+eVTp3FslyhRwIBDF09v4vDhRtxFOT+R7uH7h/mzmyA2/+lfIMWGIrffXprY
+izbV76+YQKhoqFQIDAQAB
+-----END PUBLIC KEY-----`
+
 var (
-	mimoSessionMu    sync.Mutex
-	mimoSessionCache = make(map[string]string)
+	mimoSessionMu      sync.Mutex
+	mimoSessionCache   = make(map[string]string)
+	mimoPassTokenCache = make(map[string]string)
 )
 
 type mimoEnvelope struct {
@@ -78,13 +96,17 @@ func CheckXiaomiMiMo(ctx context.Context, acc config.XiaomiMiMoAccount) AccountR
 	if cached := getCachedMimoCookie(cacheKey); cached != "" {
 		cookie = cached
 	}
+	if cachedPass := getCachedMimoPassToken(cacheKey); cachedPass != "" {
+		passToken = cachedPass
+	}
+	hasPwd := strings.TrimSpace(acc.Username) != "" && (strings.TrimSpace(acc.Password) != "" || strings.TrimSpace(acc.PasswordMD5) != "")
 
-	if cookie == "" && passToken == "" {
+	if cookie == "" && passToken == "" && !hasPwd {
 		report.Status = StatusAuthExpired
 		report.TagText = "缺少凭证"
 		report.TagColor = "orange"
-		report.Headline = "未配置控制台 Cookie 或 passToken"
-		report.AlertReason = "小米 MiMo TokenPlan 需配置 pass_token + user_id（推荐长期免维护）或控制台 Cookie"
+		report.Headline = "未配置控制台 Cookie 或自动续登凭证"
+		report.AlertReason = "小米 MiMo TokenPlan 需配置 username+password（推荐永久免维护）、pass_token 或控制台 Cookie"
 		return report
 	}
 
@@ -99,7 +121,7 @@ func CheckXiaomiMiMo(ctx context.Context, acc config.XiaomiMiMoAccount) AccountR
 	if err != nil {
 		return markError(report, "网络请求失败", err.Error())
 	}
-	if isMimoAuthExpired(status, usageEnv) && passToken != "" && userID != "" {
+	if isMimoAuthExpired(status, usageEnv) && (passToken != "" || hasPwd) {
 		loginURL := strings.TrimSpace(usageEnv.LoginURL)
 		if loginURL == "" && len(usageEnv.Data) > 0 {
 			var tmp mimoUsageData
@@ -107,17 +129,20 @@ func CheckXiaomiMiMo(ctx context.Context, acc config.XiaomiMiMoAccount) AccountR
 				loginURL = strings.TrimSpace(tmp.LoginURL)
 			}
 		}
-		mintedCookie, mintErr := mintMimoServiceCookie(ctx, client, loginURL, passToken, userID, deviceID, cleanCookie(acc.Cookie))
+		mintedCookie, freshPassToken, mintErr := mintMimoServiceCookie(ctx, client, loginURL, passToken, userID, deviceID, cleanCookie(acc.Cookie), acc)
 		if mintErr == nil && mintedCookie != "" {
-			log.Printf("[Xiaomi MiMo] %s: 已通过小米通行证 passToken 自动续期 api-platform_serviceToken", acc.Name)
+			log.Printf("[Xiaomi MiMo] %s: 已自动续期 api-platform_serviceToken", acc.Name)
 			cookie = mintedCookie
 			setCachedMimoCookie(cacheKey, cookie)
+			if freshPassToken != "" {
+				setCachedMimoPassToken(cacheKey, freshPassToken)
+			}
 			usageEnv, status, err = fetchMimoEndpoint(ctx, client, "/tokenPlan/usage", cookie)
 			if err != nil {
 				return markError(report, "网络请求失败", err.Error())
 			}
 		} else if mintErr != nil {
-			log.Printf("[Xiaomi MiMo] %s: passToken 自动续期失败: %v", acc.Name, mintErr)
+			log.Printf("[Xiaomi MiMo] %s: 自动续期失败: %v", acc.Name, mintErr)
 		}
 	}
 	if isMimoAuthExpired(status, usageEnv) {
@@ -332,6 +357,18 @@ func setCachedMimoCookie(key, cookie string) {
 	mimoSessionCache[key] = cookie
 }
 
+func getCachedMimoPassToken(key string) string {
+	mimoSessionMu.Lock()
+	defer mimoSessionMu.Unlock()
+	return mimoPassTokenCache[key]
+}
+
+func setCachedMimoPassToken(key, passToken string) {
+	mimoSessionMu.Lock()
+	defer mimoSessionMu.Unlock()
+	mimoPassTokenCache[key] = passToken
+}
+
 func parseCookiePairs(raw string) map[string]string {
 	out := make(map[string]string)
 	for _, part := range strings.Split(cleanCookie(raw), ";") {
@@ -369,13 +406,13 @@ func extractPassCredentials(acc config.XiaomiMiMoAccount, rawCookie string) (pas
 	return passToken, userID, deviceID
 }
 
-// mintMimoServiceCookie exchanges a Xiaomi Account passToken + userId + deviceId for a fresh
-// api-platform_serviceToken on platform.xiaomimimo.com via Xiaomi SSO (serviceLogin?_json=true -> serviceLoginAuth2 -> /sts).
-func mintMimoServiceCookie(ctx context.Context, client *http.Client, loginURL, passToken, userID, deviceID, baseCookie string) (string, error) {
+// mintMimoServiceCookie exchanges a Xiaomi Account passToken or username+password for a fresh
+// api-platform_serviceToken on platform.xiaomimimo.com via Xiaomi SSO (3-tier: serviceLogin?_json=true -> passToken Auth2 -> password Auth2 -> /sts).
+func mintMimoServiceCookie(ctx context.Context, client *http.Client, loginURL, passToken, userID, deviceID, baseCookie string, acc config.XiaomiMiMoAccount) (string, string, error) {
 	if loginURL == "" {
 		env, _, err := fetchMimoEndpoint(ctx, client, "/balance", "")
 		if err != nil {
-			return "", fmt.Errorf("fetch SSO loginUrl: %w", err)
+			return "", "", fmt.Errorf("fetch SSO loginUrl: %w", err)
 		}
 		loginURL = strings.TrimSpace(env.LoginURL)
 		if loginURL == "" && len(env.Data) > 0 {
@@ -388,19 +425,25 @@ func mintMimoServiceCookie(ctx context.Context, client *http.Client, loginURL, p
 		}
 	}
 	if loginURL == "" {
-		return "", fmt.Errorf("xiaomi mimo API did not return loginUrl")
+		return "", "", fmt.Errorf("xiaomi mimo API did not return loginUrl")
 	}
 
 	callback := extractCallbackFromLoginURL(loginURL)
 	if callback == "" {
-		return "", fmt.Errorf("failed to extract callback from loginUrl")
+		return "", "", fmt.Errorf("failed to extract callback from loginUrl")
 	}
 
 	if deviceID == "" {
 		deviceID = "wb_rattler_default"
 	}
-	accountCookie := fmt.Sprintf("passToken=%s; deviceId=%s; uLocale=zh_CN; pass_ua=web; passInfo=login-end; userId=%s",
-		strings.Trim(passToken, `"`), deviceID, userID)
+	baseAccountCookie := fmt.Sprintf("deviceId=%s; uLocale=zh_CN; pass_ua=web; passInfo=login-end", deviceID)
+	accountCookie := baseAccountCookie
+	if passToken != "" {
+		accountCookie = fmt.Sprintf("passToken=%s; %s", strings.Trim(passToken, `"`), accountCookie)
+	}
+	if userID != "" {
+		accountCookie = fmt.Sprintf("%s; userId=%s", accountCookie, userID)
+	}
 
 	chromeUA := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
 	setCommonHeaders := func(req *http.Request) {
@@ -415,23 +458,24 @@ func mintMimoServiceCookie(ctx context.Context, client *http.Client, loginURL, p
 	slURL := fmt.Sprintf("https://account.xiaomi.com/pass/serviceLogin?_json=true&sid=api-platform&callback=%s", url.QueryEscape(callback))
 	req1, err := http.NewRequestWithContext(ctx, http.MethodGet, slURL, nil)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	setCommonHeaders(req1)
 
 	resp1, err := client.Do(req1)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	body1, _ := io.ReadAll(resp1.Body)
 	resp1.Body.Close()
 
 	loginBody, err := parseXiaomiJSONP(string(body1))
 	if err != nil {
-		return "", fmt.Errorf("serviceLogin parse error: %w", err)
+		return "", "", fmt.Errorf("serviceLogin parse error: %w", err)
 	}
+	freshPassToken := extractPassTokenFromResp(loginBody, resp1)
 
-	stsLocation := strings.TrimSpace( fmt.Sprint(loginBody["location"]) )
+	stsLocation := strings.TrimSpace(fmt.Sprint(loginBody["location"]))
 	if loginBody["location"] == nil {
 		stsLocation = ""
 	}
@@ -440,7 +484,7 @@ func mintMimoServiceCookie(ctx context.Context, client *http.Client, loginURL, p
 	if parseCode(loginBody["code"]) != 0 || !strings.HasPrefix(stsLocation, "https://platform.xiaomimimo.com") {
 		sign, _ := loginBody["_sign"].(string)
 		if sign == "" {
-			return "", fmt.Errorf("serviceLogin did not return _sign (code=%v)", loginBody["code"])
+			return "", "", fmt.Errorf("serviceLogin did not return _sign (code=%v)", loginBody["code"])
 		}
 		serviceParam, _ := loginBody["serviceParam"].(string)
 		if serviceParam == "" {
@@ -448,47 +492,133 @@ func mintMimoServiceCookie(ctx context.Context, client *http.Client, loginURL, p
 		}
 		qs, _ := loginBody["qs"].(string)
 
-		form := url.Values{}
-		form.Set("bizDeviceType", "")
-		form.Set("needTheme", "false")
-		form.Set("theme", "")
-		form.Set("showActiveX", "false")
-		form.Set("serviceParam", serviceParam)
-		form.Set("callback", callback)
-		form.Set("qs", qs)
-		form.Set("sid", "api-platform")
-		form.Set("_sign", sign)
-		form.Set("_json", "true")
-		form.Set("policyName", "miaccount")
-		form.Set("captCode", "")
+		baseForm := func() url.Values {
+			f := url.Values{}
+			f.Set("bizDeviceType", "")
+			f.Set("needTheme", "false")
+			f.Set("theme", "")
+			f.Set("showActiveX", "false")
+			f.Set("serviceParam", serviceParam)
+			f.Set("callback", callback)
+			f.Set("qs", qs)
+			f.Set("sid", "api-platform")
+			f.Set("_sign", sign)
+			f.Set("_json", "true")
+			f.Set("policyName", "miaccount")
+			f.Set("captCode", "")
+			return f
+		}
 
-		req2, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://account.xiaomi.com/pass/serviceLoginAuth2", strings.NewReader(form.Encode()))
-		if err != nil {
-			return "", err
-		}
-		setCommonHeaders(req2)
-		req2.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+		var lastAuthErr error
+		stsLocation = ""
 
-		resp2, err := client.Do(req2)
-		if err != nil {
-			return "", err
+		// Tier 2: Passwordless passToken Auth2
+		if passToken != "" {
+			form := baseForm()
+			req2, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://account.xiaomi.com/pass/serviceLoginAuth2", strings.NewReader(form.Encode()))
+			if err == nil {
+				setCommonHeaders(req2)
+				req2.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+				if resp2, err := client.Do(req2); err == nil {
+					body2, _ := io.ReadAll(resp2.Body)
+					resp2.Body.Close()
+					if auth2Body, err := parseXiaomiJSONP(string(body2)); err == nil {
+						if fp := extractPassTokenFromResp(auth2Body, resp2); fp != "" {
+							freshPassToken = fp
+						}
+						if parseCode(auth2Body["code"]) == 0 {
+							stsLocation, _ = auth2Body["location"].(string)
+						} else {
+							desc, _ := auth2Body["description"].(string)
+							lastAuthErr = fmt.Errorf("serviceLoginAuth2 failed (code=%v %s)", auth2Body["code"], desc)
+						}
+					}
+				}
+			}
 		}
-		body2, _ := io.ReadAll(resp2.Body)
-		resp2.Body.Close()
 
-		auth2Body, err := parseXiaomiJSONP(string(body2))
-		if err != nil {
-			return "", fmt.Errorf("serviceLoginAuth2 parse error: %w", err)
+		// Tier 3: Password Auth2 fallback (when username + password/password_md5 are configured)
+		username := strings.TrimSpace(acc.Username)
+		pwdMD5 := strings.ToUpper(strings.TrimSpace(acc.PasswordMD5))
+		if pwdMD5 == "" && strings.TrimSpace(acc.Password) != "" {
+			sum := md5.Sum([]byte(strings.TrimSpace(acc.Password)))
+			pwdMD5 = strings.ToUpper(fmt.Sprintf("%x", sum))
 		}
-		if parseCode(auth2Body["code"]) != 0 {
-			desc, _ := auth2Body["description"].(string)
-			return "", fmt.Errorf("serviceLoginAuth2 failed (code=%v %s)", auth2Body["code"], desc)
+		if stsLocation == "" && username != "" && pwdMD5 != "" {
+			userAES, eui, encErr := encryptXiaomiUser(username)
+			if encErr != nil {
+				return "", "", fmt.Errorf("encrypt xiaomi user failed: %w", encErr)
+			}
+			fp := strings.TrimSpace(acc.DeviceFingerprint)
+			if fp == "" {
+				sum := md5.Sum([]byte(deviceID))
+				fp = fmt.Sprintf("%x", sum)
+			}
+			form := baseForm()
+			form.Set("user", userAES)
+			form.Set("hash", pwdMD5)
+			form.Set("deviceFingerprint", fp)
+			if len(username) == 11 && isAllDigits(username) {
+				form.Set("cc", "+86")
+			}
+
+			req3, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://account.xiaomi.com/pass/serviceLoginAuth2", strings.NewReader(form.Encode()))
+			if err != nil {
+				return "", "", err
+			}
+			req3.Header.Set("Accept", "application/json, text/plain, */*")
+			req3.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
+			req3.Header.Set("Cache-Control", "no-cache")
+			req3.Header.Set("User-Agent", chromeUA)
+			req3.Header.Set("Cookie", baseAccountCookie)
+			req3.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+			req3.Header.Set("Origin", "https://account.xiaomi.com")
+			req3.Header.Set("Referer", fmt.Sprintf("https://account.xiaomi.com/fe/service/login/password?_group=DEFAULT&sid=api-platform&qs=%s", url.QueryEscape(qs)))
+			req3.Header.Set("X-Requested-With", "XMLHttpRequest")
+			req3.Header.Set("DNT", "1")
+			req3.Header.Set("Sec-Fetch-Dest", "empty")
+			req3.Header.Set("Sec-Fetch-Mode", "cors")
+			req3.Header.Set("Sec-Fetch-Site", "same-origin")
+			req3.Header.Set("sec-ch-ua", `"Google Chrome";v="153", "Not_A Brand";v="8", "Chromium";v="153"`)
+			req3.Header.Set("sec-ch-ua-mobile", "?0")
+			req3.Header.Set("sec-ch-ua-platform", `"Windows"`)
+			req3.Header.Set("EUI", eui)
+
+			resp3, err := client.Do(req3)
+			if err != nil {
+				return "", "", err
+			}
+			body3, _ := io.ReadAll(resp3.Body)
+			resp3.Body.Close()
+
+			auth3Body, err := parseXiaomiJSONP(string(body3))
+			if err != nil {
+				return "", "", fmt.Errorf("password serviceLoginAuth2 parse error: %w", err)
+			}
+			if fpTok := extractPassTokenFromResp(auth3Body, resp3); fpTok != "" {
+				freshPassToken = fpTok
+			}
+			if parseCode(auth3Body["code"]) != 0 {
+				desc, _ := auth3Body["description"].(string)
+				capt, _ := auth3Body["captchaUrl"].(string)
+				if capt != "" {
+					return "", "", fmt.Errorf("password login requires captcha (code=%v %s)", auth3Body["code"], desc)
+				}
+				return "", "", fmt.Errorf("password serviceLoginAuth2 failed (code=%v %s)", auth3Body["code"], desc)
+			}
+			stsLocation, _ = auth3Body["location"].(string)
 		}
-		stsLocation, _ = auth2Body["location"].(string)
+
+		if stsLocation == "" {
+			if lastAuthErr != nil {
+				return "", "", lastAuthErr
+			}
+			return "", "", fmt.Errorf("SSO did not return /sts location")
+		}
 	}
 
 	if stsLocation == "" {
-		return "", fmt.Errorf("SSO did not return /sts location")
+		return "", "", fmt.Errorf("SSO did not return /sts location")
 	}
 
 	// Step 3: Follow /sts and subsequent redirects on platform.xiaomimimo.com to collect cookies
@@ -503,7 +633,7 @@ func mintMimoServiceCookie(ctx context.Context, client *http.Client, loginURL, p
 	for hop := 0; hop < 5 && currentURL != ""; hop++ {
 		u, err := url.Parse(currentURL)
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
 		if strings.EqualFold(u.Hostname(), "platform.xiaomimimo.com") && u.Scheme == "http" {
 			u.Scheme = "https"
@@ -511,7 +641,7 @@ func mintMimoServiceCookie(ctx context.Context, client *http.Client, loginURL, p
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, currentURL, nil)
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
 		req.Header.Set("User-Agent", chromeUA)
 		if len(platformJar) > 0 {
@@ -519,7 +649,7 @@ func mintMimoServiceCookie(ctx context.Context, client *http.Client, loginURL, p
 		}
 		resp, err := client.Do(req)
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
 		_, _ = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
@@ -547,9 +677,85 @@ func mintMimoServiceCookie(ctx context.Context, client *http.Client, loginURL, p
 	}
 
 	if platformJar["api-platform_serviceToken"] == "" {
-		return "", fmt.Errorf("/sts did not issue api-platform_serviceToken")
+		return "", "", fmt.Errorf("/sts did not issue api-platform_serviceToken")
 	}
-	return serializeCookieMap(platformJar), nil
+	return serializeCookieMap(platformJar), freshPassToken, nil
+}
+
+func extractPassTokenFromResp(body map[string]any, resp *http.Response) string {
+	if body != nil {
+		if pt, ok := body["passToken"].(string); ok {
+			pt = strings.TrimSpace(pt)
+			if pt != "" && !strings.EqualFold(pt, "EXPIRED") {
+				return pt
+			}
+		}
+	}
+	if resp != nil {
+		for _, rawSC := range resp.Header.Values("Set-Cookie") {
+			name, val, _, expired := parseRawSetCookie(rawSC)
+			if name == "passToken" && val != "" && !expired {
+				return strings.Trim(val, `"`)
+			}
+		}
+	}
+	return ""
+}
+
+func encryptXiaomiUser(username string) (userAES, eui string, err error) {
+	const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*"
+	keyBytes := make([]byte, 16)
+	for i := 0; i < 16; i++ {
+		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+		if err != nil {
+			return "", "", err
+		}
+		keyBytes[i] = charset[n.Int64()]
+	}
+
+	blockPEM, _ := pem.Decode([]byte(xiaomiRSAPubKeyPEM))
+	if blockPEM == nil {
+		return "", "", fmt.Errorf("invalid xiaomi RSA public key PEM")
+	}
+	pubInterface, err := x509.ParsePKIXPublicKey(blockPEM.Bytes)
+	if err != nil {
+		return "", "", err
+	}
+	rsaPub, ok := pubInterface.(*rsa.PublicKey)
+	if !ok {
+		return "", "", fmt.Errorf("not an RSA public key")
+	}
+
+	keyB64 := base64.StdEncoding.EncodeToString(keyBytes)
+	rsaCipher, err := rsa.EncryptPKCS1v15(rand.Reader, rsaPub, []byte(keyB64))
+	if err != nil {
+		return "", "", err
+	}
+	rsaB64 := base64.StdEncoding.EncodeToString(rsaCipher)
+	fieldsB64 := base64.StdEncoding.EncodeToString([]byte("user"))
+	eui = rsaB64 + "." + fieldsB64
+
+	aesBlock, err := aes.NewCipher(keyBytes)
+	if err != nil {
+		return "", "", err
+	}
+	iv := []byte("0102030405060708")
+	plain := []byte(username)
+	padLen := aes.BlockSize - (len(plain) % aes.BlockSize)
+	padded := append(bytes.Clone(plain), bytes.Repeat([]byte{byte(padLen)}, padLen)...)
+	encrypted := make([]byte, len(padded))
+	cipher.NewCBCEncrypter(aesBlock, iv).CryptBlocks(encrypted, padded)
+	userAES = base64.StdEncoding.EncodeToString(encrypted)
+	return userAES, eui, nil
+}
+
+func isAllDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return len(s) > 0
 }
 
 func extractCallbackFromLoginURL(loginURL string) string {
