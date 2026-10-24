@@ -436,6 +436,7 @@ func mintMimoServiceCookie(ctx context.Context, client *http.Client, loginURL, p
 	if deviceID == "" {
 		deviceID = "wb_rattler_default"
 	}
+	pairs := parseCookiePairs(baseCookie)
 	baseAccountCookie := fmt.Sprintf("deviceId=%s; uLocale=zh_CN; pass_ua=web; passInfo=login-end", deviceID)
 	accountCookie := baseAccountCookie
 	if passToken != "" {
@@ -443,6 +444,9 @@ func mintMimoServiceCookie(ctx context.Context, client *http.Client, loginURL, p
 	}
 	if userID != "" {
 		accountCookie = fmt.Sprintf("%s; userId=%s", accountCookie, userID)
+	}
+	if cUserID := strings.TrimSpace(pairs["cUserId"]); cUserID != "" {
+		accountCookie = fmt.Sprintf("%s; cUserId=%s", accountCookie, cUserID)
 	}
 
 	chromeUA := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
@@ -607,6 +611,11 @@ func mintMimoServiceCookie(ctx context.Context, client *http.Client, loginURL, p
 				return "", "", fmt.Errorf("password serviceLoginAuth2 failed (code=%v %s)", auth3Body["code"], desc)
 			}
 			stsLocation, _ = auth3Body["location"].(string)
+			if stsLocation == "" {
+				if notif, _ := auth3Body["notificationUrl"].(string); notif != "" {
+					return "", "", fmt.Errorf("需要首次设备安全验证，请打开链接完成验证: %s", notif)
+				}
+			}
 		}
 
 		if stsLocation == "" {
